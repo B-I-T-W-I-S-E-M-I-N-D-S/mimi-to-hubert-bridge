@@ -56,57 +56,249 @@ except ImportError:
 
 class MimiExtractor:
     """
-    Wraps the HuggingFace Mimi encoder (kyutai/moshiko-pytorch-bf16) to produce
-    (T, num_codebooks) integer token tensors at 12.5 Hz.
+    Loads the Mimi audio tokenizer from kyutai/moshiko-pytorch-bf16 on HuggingFace.
 
-    Install:  pip install transformers>=4.40.0
-    Model:    kyutai/moshiko-pytorch-bf16  (or any repo containing a MimiModel)
+    The kyutai/moshiko-pytorch-bf16 repo does NOT contain a preprocessor_config.json
+    or processor_config.json, so AutoFeatureExtractor / MimiModel.from_pretrained()
+    will always fail for it.  Instead we download the dedicated Mimi weights file
+    (tokenizer-e351c8d8-checkpoint125.safetensors) via hf_hub_download and build
+    the model with the moshi library, exactly as the reference loader.py does.
+
+    Two back-ends are attempted in order:
+      1. moshi  — the official Kyutai Python package (pip install moshi).
+         Uses hf_hub_download + safetensors, no preprocessor_config required.
+      2. transformers MimiModel  — works when model_name points to a repo that
+         *does* have preprocessor_config.json (e.g. kyutai/mimi).
+      3. Dummy  — random tokens so the rest of the pipeline stays runnable.
+
+    Install (recommended):
+        pip install moshi safetensors huggingface_hub
+    Alternative (only for repos with HF processor configs):
+        pip install transformers>=4.40.0
     """
 
-    # Number of codebooks exposed by the Mimi encoder
+    # File name of the Mimi weights inside the kyutai/moshiko-pytorch-bf16 repo
+    _MIMI_SAFETENSORS = "tokenizer-e351c8d8-checkpoint125.safetensors"
+    # Number of codebooks we ask Mimi to use (matches config.yaml num_codebooks)
     NUM_CODEBOOKS = 8
+    # Mimi operates at 24 kHz internally; hop = 1920 → 12.5 Hz frame rate
+    _MIMI_SR = 24000
+    _HOP = 1920   # 24000 / 12.5
 
     def __init__(self, model_name: str = "kyutai/moshiko-pytorch-bf16", device: str = "cpu"):
         self.device = device
+        self.model_name = model_name
         self._ok = False
+        self._backend = None   # "moshi" | "transformers"
+
+        # ── Backend 1: moshi library (handles raw safetensors repos) ──────────
+        if not self._ok:
+            self._try_load_moshi(model_name, device)
+
+        # ── Backend 2: transformers MimiModel (needs preprocessor_config) ────
+        if not self._ok:
+            self._try_load_transformers(model_name, device)
+
+        if not self._ok:
+            logger.warning(
+                f"[MimiExtractor] All loading strategies failed for '{model_name}'. "
+                "Running with a DUMMY extractor (random tokens). "
+                "To fix: pip install moshi safetensors huggingface_hub"
+            )
+
+    # ── Private loader helpers ────────────────────────────────────────────────
+
+    def _try_load_moshi(self, model_name: str, device: str):
+        """
+        Download tokenizer-e351c8d8-checkpoint125.safetensors from HF and build
+        a MimiModel using the moshi library's get_mimi() helper and the
+        hard-coded architecture config (_mimi_config) from loader.py.
+        """
+        try:
+            from huggingface_hub import hf_hub_download
+            from safetensors.torch import load_file as sf_load
+            import torch as _torch
+
+            logger.info(
+                f"[MimiExtractor] Downloading Mimi weights from {model_name} "
+                f"({self._MIMI_SAFETENSORS}) via hf_hub_download …"
+            )
+            weights_path = hf_hub_download(
+                repo_id=model_name,
+                filename=self._MIMI_SAFETENSORS,
+            )
+            logger.info(f"[MimiExtractor] Weights cached at {weights_path}")
+
+            # Build the Mimi model using the moshi library
+            try:
+                from moshi.models.loaders import get_mimi
+                self.model = get_mimi(weights_path, device=device)
+                self.model.set_num_codebooks(self.NUM_CODEBOOKS)
+                self.model.eval()
+                self._backend = "moshi"
+                self._ok = True
+                logger.info(
+                    f"[MimiExtractor] Loaded via moshi library "
+                    f"(num_codebooks={self.NUM_CODEBOOKS})."
+                )
+                return
+            except ImportError:
+                logger.info(
+                    "[MimiExtractor] moshi package not installed; "
+                    "attempting manual safetensors load with built-in architecture …"
+                )
+
+            # ── Fallback: build architecture manually without the moshi package ──
+            # Architecture constants copied directly from loader.py (_mimi_config).
+            self._weights_path = weights_path
+            self._ok = True
+            self._backend = "safetensors_raw"
+            self._sf_path = weights_path
+            self._build_moshi_manual(weights_path, device)
+
+        except Exception as e:
+            logger.info(f"[MimiExtractor] moshi/safetensors strategy failed: {e}")
+
+    def _build_moshi_manual(self, weights_path: str, device: str):
+        """
+        Instantiate Mimi manually using only torch + safetensors, without the
+        moshi package. Uses the exact architecture kwargs from loader.py.
+        Falls back to transformers if this also fails.
+        """
+        try:
+            from safetensors.torch import load_file as sf_load
+
+            # These are the exact kwargs from loader.py
+            seanet_kwargs = {
+                "channels": 1, "dimension": 512, "causal": True,
+                "n_filters": 64, "n_residual_layers": 1, "activation": "ELU",
+                "compress": 2, "dilation_base": 2,
+                "disable_norm_outer_blocks": 0, "kernel_size": 7,
+                "residual_kernel_size": 3, "last_kernel_size": 3,
+                "norm": "none", "pad_mode": "constant",
+                "ratios": [8, 6, 5, 4], "true_skip": True,
+            }
+            quantizer_kwargs = {
+                "dimension": 256, "n_q": 32, "bins": 2048,
+                "input_dimension": seanet_kwargs["dimension"],
+                "output_dimension": seanet_kwargs["dimension"],
+            }
+            transformer_kwargs = {
+                "d_model": seanet_kwargs["dimension"], "num_heads": 8,
+                "num_layers": 8, "causal": True, "layer_scale": 0.01,
+                "context": 250, "conv_layout": True, "max_period": 10000,
+                "gating": "none", "norm": "layer_norm",
+                "positional_embedding": "rope", "dim_feedforward": 2048,
+                "input_dimension": seanet_kwargs["dimension"],
+                "output_dimensions": [seanet_kwargs["dimension"]],
+            }
+
+            from moshi.modules import SEANetEncoder, SEANetDecoder
+            from moshi.modules import transformer as moshi_transformer
+            from moshi.quantization import SplitResidualVectorQuantizer
+            from moshi.models.compression import MimiModel
+
+            enc = SEANetEncoder(**seanet_kwargs)
+            dec = SEANetDecoder(**seanet_kwargs)
+            enc_tr = moshi_transformer.ProjectedTransformer(device=device, **transformer_kwargs)
+            dec_tr = moshi_transformer.ProjectedTransformer(device=device, **transformer_kwargs)
+            quant = SplitResidualVectorQuantizer(**quantizer_kwargs)
+
+            model = MimiModel(
+                enc, dec, quant,
+                channels=1, sample_rate=24000, frame_rate=12.5,
+                encoder_frame_rate=24000 / enc.hop_length,
+                causal=True, resample_method="conv",
+                encoder_transformer=enc_tr, decoder_transformer=dec_tr,
+            ).to(device=device)
+            model.eval()
+
+            state = sf_load(weights_path, device=str(device))
+            model.load_state_dict(state)
+            model.set_num_codebooks(self.NUM_CODEBOOKS)
+
+            self.model = model
+            self._backend = "moshi_manual"
+            logger.info("[MimiExtractor] Manual moshi architecture load succeeded.")
+
+        except Exception as e:
+            logger.warning(
+                f"[MimiExtractor] Manual architecture build failed ({e}); "
+                "will try transformers backend next."
+            )
+            self._ok = False
+
+    def _try_load_transformers(self, model_name: str, device: str):
+        """
+        Fall back to transformers MimiModel + AutoFeatureExtractor.
+        Works only for repos that ship preprocessor_config.json (e.g. kyutai/mimi).
+        """
         try:
             from transformers import MimiModel, AutoFeatureExtractor
-            logger.info(f"Loading Mimi encoder from {model_name} …")
+            logger.info(
+                f"[MimiExtractor] Trying transformers AutoFeatureExtractor for '{model_name}' …"
+            )
             self.processor = AutoFeatureExtractor.from_pretrained(model_name)
             self.model = MimiModel.from_pretrained(model_name)
             self.model.eval().to(device)
+            self._backend = "transformers"
             self._ok = True
-            logger.info("Mimi encoder loaded successfully.")
+            logger.info("[MimiExtractor] Loaded via transformers MimiModel.")
         except Exception as e:
-            logger.warning(
-                f"Could not load Mimi from HuggingFace ({e}). "
-                "Falling back to dummy extractor. "
-                "Install with:  pip install transformers>=4.40.0"
-            )
+            logger.info(f"[MimiExtractor] transformers strategy failed: {e}")
+
+    # ── Public interface ──────────────────────────────────────────────────────
 
     @torch.no_grad()
     def extract(self, wav: torch.Tensor, sr: int) -> torch.Tensor:
         """
-        wav : (1, samples)  float32, at the model's expected sample rate
-        Returns: (T, NUM_CODEBOOKS) int64 tensor  — T ≈ samples / 1280 ≈ 12.5 Hz
+        Encode a waveform into Mimi discrete tokens.
+
+        wav : (1, samples)  float32  — any supported sample rate (resampled internally
+              to 24 kHz for moshi backends, or to whatever the transformers model needs)
+        sr  : sample rate of `wav`
+
+        Returns: (T, NUM_CODEBOOKS) int64 tensor  at 12.5 Hz
         """
         if not self._ok:
-            T = max(1, wav.shape[-1] // 1280)
+            T = max(1, wav.shape[-1] // self._HOP)
             return torch.randint(0, 2048, (T, self.NUM_CODEBOOKS))
 
-        wav_np = wav.squeeze(0).numpy()          # (samples,)
-        inputs = self.processor(
-            raw_audio=wav_np,
-            sampling_rate=sr,
-            return_tensors="pt",
-        )
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        # ── moshi / moshi_manual / safetensors_raw backends ──────────────────
+        if self._backend in ("moshi", "moshi_manual", "safetensors_raw"):
+            # Mimi always expects 24 kHz mono audio
+            if sr != self._MIMI_SR:
+                if TORCHAUDIO_OK:
+                    import torchaudio
+                    wav = torchaudio.functional.resample(wav, sr, self._MIMI_SR)
+                else:
+                    # numpy-based fallback resampling
+                    ratio = self._MIMI_SR / sr
+                    new_len = int(wav.shape[-1] * ratio)
+                    wav_np = wav.squeeze(0).numpy()
+                    indices = np.linspace(0, len(wav_np) - 1, new_len)
+                    wav_np = np.interp(indices, np.arange(len(wav_np)), wav_np).astype(np.float32)
+                    wav = torch.from_numpy(wav_np).unsqueeze(0)
 
-        # encode() returns an EncoderOutput whose .audio_codes is (B, num_codebooks, T)
+            # moshi encode() expects (B, C, T); returns codes (B, num_codebooks, T)
+            wav_device = wav.to(self.device)
+            if wav_device.dim() == 2:
+                wav_device = wav_device.unsqueeze(0)   # (1, 1, T)
+            elif wav_device.dim() == 1:
+                wav_device = wav_device.unsqueeze(0).unsqueeze(0)
+
+            codes = self.model.encode(wav_device)      # (B, num_codebooks, T)
+            codes = codes.squeeze(0)                   # (num_codebooks, T)
+            codes = codes.transpose(0, 1)              # (T, num_codebooks)
+            return codes.cpu().long()
+
+        # ── transformers backend ──────────────────────────────────────────────
+        wav_np = wav.squeeze(0).numpy()
+        inputs = self.processor(raw_audio=wav_np, sampling_rate=sr, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
         encoder_out = self.model.encode(**inputs)
         codes = encoder_out.audio_codes          # (B, num_codebooks, T)
-        codes = codes.squeeze(0)                 # (num_codebooks, T)
-        codes = codes.transpose(0, 1)            # (T, num_codebooks)
+        codes = codes.squeeze(0).transpose(0, 1)  # (T, num_codebooks)
         return codes.cpu().long()
 
 
