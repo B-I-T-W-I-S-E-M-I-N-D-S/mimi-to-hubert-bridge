@@ -304,47 +304,144 @@ class MimiExtractor:
 
 class HuBERTExtractor:
     """
-    Wraps a pretrained HuBERT-large model to produce (T, 1024) features at ~50 Hz.
-    Default: facebook/hubert-large-ls960-ft  (1024-dim hidden states)
+    ONNX-based HuBERT streaming extractor using hubert_streaming_fix_kv.onnx.
+
+    Produces (T, 1024) float32 features at 25 Hz (one frame per 40 ms),
+    with each output frame being the mean of two 20 ms ONNX encoder frames.
+
+    This replaces the transformers HubertModel backend which required a
+    PyTorch HuBERT checkpoint and a Wav2Vec2FeatureExtractor.
+
+    Args:
+        model_name : Path to the .onnx model file
+                     (e.g. "./model/hubert_streaming_fix_kv.onnx")
+        device     : Ignored — ONNX runtime always runs on CPU.
+                     Kept for API compatibility with MimiExtractor.
     """
+
+    # ONNX streaming chunk config: (left_context, centre, right_context) in frames
+    _CHUNKSIZE = (3, 5, 2)
+    _FEAT_DIM  = 1024   # HuBERT-large hidden size
+    _TARGET_SR = 16000  # Model expects 16 kHz audio
 
     def __init__(
         self,
-        model_name: str = "facebook/hubert-large-ls960-ft",
-        device: str = "cpu",
+        model_name: str = "./model/hubert_streaming_fix_kv.onnx",
+        device: str = "cpu",   # kept for API compatibility; ONNX runs on CPU
     ):
-        self.device = device
-        self._ok = False
-        self._feat_dim = 1024  # HuBERT-large hidden size
-        try:
-            from transformers import HubertModel, Wav2Vec2FeatureExtractor
-            logger.info(f"Loading HuBERT from {model_name} …")
-            self.processor = Wav2Vec2FeatureExtractor.from_pretrained(model_name)
-            self.model = HubertModel.from_pretrained(model_name)
-            self.model.eval().to(device)
-            # Detect actual hidden size from config
-            self._feat_dim = self.model.config.hidden_size
-            self._ok = True
-            logger.info(f"HuBERT loaded — hidden_size={self._feat_dim}.")
-        except Exception as e:
-            logger.warning(f"Could not load HuBERT: {e}. Using dummy extractor.")
+        self.device    = device
+        self._ok       = False
+        self._feat_dim = self._FEAT_DIM
 
-    @torch.no_grad()
+        try:
+            import onnxruntime
+            import librosa as _librosa  # noqa: F401 — verify availability
+
+            logger.info(f"[HuBERTExtractor] Loading ONNX model from {model_name} …")
+            sess_opt = onnxruntime.SessionOptions()
+            sess_opt.intra_op_num_threads = 4
+
+            self._ort_session = onnxruntime.InferenceSession(
+                model_name,
+                sess_options=sess_opt,
+                providers=["CPUExecutionProvider"],
+            )
+            self._ok = True
+            logger.info(
+                f"[HuBERTExtractor] ONNX HuBERT loaded successfully "
+                f"(feat_dim={self._feat_dim}, chunksize={self._CHUNKSIZE})."
+            )
+        except Exception as e:
+            logger.warning(
+                f"[HuBERTExtractor] Could not load ONNX HuBERT from '{model_name}': {e}. "
+                "Using dummy extractor. "
+                "To fix: pip install onnxruntime librosa && check model path."
+            )
+
+    # ── Internal ONNX inference ───────────────────────────────────────────────
+
+    def _forward_chunk(self, waveform_chunk: np.ndarray) -> np.ndarray:
+        """Run one chunk through the ONNX encoder. Returns (chunk_frames, 1024)."""
+        encoding = self._ort_session.run(
+            None,
+            {"input_values": waveform_chunk[None, :].astype(np.float32)},
+        )[0]   # (1, chunk_frames, 1024) or (chunk_frames, 1024)
+        if encoding.ndim == 3:
+            encoding = encoding[0]   # squeeze batch dim if present
+        return encoding              # (chunk_frames, 1024)
+
+    def _extract_from_numpy(self, speech: np.ndarray) -> np.ndarray:
+        """
+        Streaming chunk extraction matching hubert_streaming_onnx.py exactly.
+
+        speech   : 1-D float32 array at 16 kHz
+        Returns  : (T, 1024) float32 numpy array at 25 Hz
+        """
+        chunksize = self._CHUNKSIZE     # (3, 5, 2)
+        sr        = self._TARGET_SR
+
+        num_f    = math.ceil(len(speech) / sr * 25)   # total output frames at 25 Hz
+        split_len = int(sum(chunksize) * 0.04 * sr) + 80
+
+        # Pad signal: left pad = left_context + right_context samples, right pad = split_len
+        left_pad_frames = chunksize[0] + chunksize[2]   # = sum(chunksize) - centre = 5
+        left_pad  = split_len - int(sum(chunksize[1:]) * 0.04 * sr)
+        right_pad = split_len
+
+        speech_pad = np.concatenate([
+            np.zeros(left_pad,  dtype=speech.dtype),
+            speech,
+            np.zeros(right_pad, dtype=speech.dtype),
+        ])
+
+        # Indices into the ONNX output that are the "valid" centre frames
+        valid_feat_s = -sum(chunksize[1:]) * 2   # -(5+2)*2 = -14
+        valid_feat_e = -chunksize[2] * 2          # -2*2    = -4
+
+        res_lst = []
+        i = 0
+        while i < num_f:
+            sss = int(i * 0.04 * sr)
+            eee = sss + split_len
+            chunk_enc = self._forward_chunk(speech_pad[sss:eee])  # (20, 1024)
+
+            valid_enc  = chunk_enc[valid_feat_s:valid_feat_e]     # (10, 1024)
+            # Average pairs of 20 ms frames → 40 ms / 25 Hz output
+            valid_feat = valid_enc.reshape(chunksize[1], 2, self._FEAT_DIM).mean(1)  # (5, 1024)
+            res_lst.append(valid_feat)
+            i += chunksize[1]
+
+        ret = np.concatenate(res_lst, axis=0)  # (N*5, 1024)
+        ret = ret[:num_f]                       # trim to exact length
+        return ret.astype(np.float32)
+
+    # ── Public interface ──────────────────────────────────────────────────────
+
     def extract(self, wav: torch.Tensor, sr: int) -> torch.Tensor:
         """
-        wav : (1, samples) at 16 kHz
-        Returns: (T, feat_dim) float32 tensor
+        Extract HuBERT features from a waveform tensor.
+
+        wav : (1, samples) float32 torch.Tensor — any sample rate
+              (resampled internally to 16 kHz before ONNX inference)
+        sr  : sample rate of `wav`
+
+        Returns: (T, 1024) float32 torch.Tensor at 25 Hz
         """
         if not self._ok:
-            T = max(1, wav.shape[-1] // 320)   # approx 50 Hz at 16 kHz
+            T = max(1, wav.shape[-1] // 640)   # approx 25 Hz at 16 kHz
             return torch.randn(T, self._feat_dim)
 
-        wav_np = wav.squeeze().numpy()
-        inputs = self.processor(wav_np, sampling_rate=16000, return_tensors="pt")
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        outputs = self.model(**inputs)
-        feats = outputs.last_hidden_state.squeeze(0).cpu().float()  # (T, feat_dim)
-        return feats
+        import librosa
+
+        # Convert torch tensor → numpy mono float32
+        wav_np = wav.squeeze().numpy().astype(np.float32)
+
+        # Resample to 16 kHz if needed (librosa handles any source SR)
+        if sr != self._TARGET_SR:
+            wav_np = librosa.resample(wav_np, orig_sr=sr, target_sr=self._TARGET_SR)
+
+        feats = self._extract_from_numpy(wav_np)    # (T, 1024) numpy
+        return torch.from_numpy(feats)              # (T, 1024) float32 tensor
 
 
 def extract_f0_energy(

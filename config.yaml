@@ -76,7 +76,7 @@ data:
 
 paths:
   # HuBERT-large (1024-dim hidden states) — required for 1024-d targets
-  hubert_model: "facebook/hubert-large-ls960-ft"
+  hubert_model: "./model/hubert_streaming_fix_kv.onnx"  # ← change this
   # Mimi encoder via HuggingFace — no moshi git install needed
   mimi_model: "kyutai/moshiko-pytorch-bf16"
   checkpoint_dir: "checkpoints"

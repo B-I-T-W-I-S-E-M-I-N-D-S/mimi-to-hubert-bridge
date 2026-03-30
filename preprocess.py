@@ -104,7 +104,8 @@ def preextract_features(
     from dataset import MimiExtractor, HuBERTExtractor
     import numpy as np
 
-    mimi_ext   = MimiExtractor(cfg["paths"]["mimi_model"],   device)
+    mimi_ext   = MimiExtractor(cfg["paths"]["mimi_model"], device)
+    # hubert_model must point to the ONNX file, e.g. ./model/hubert_streaming_fix_kv.onnx
     hubert_ext = HuBERTExtractor(cfg["paths"]["hubert_model"], device)
     sr         = cfg["data"]["sample_rate"]
 
