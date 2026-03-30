@@ -76,6 +76,16 @@ pip install -r requirements.txt
 ### 2. Prepare data
 
 ```bash
+#multiple_GPU_use
+!torchrun --nproc_per_node=4 preprocess.py \
+    --dataset librispeech \
+    --root ./data/LibriSpeech/train-clean-100 \
+    --out_dir data \
+    --val_frac 0.1 \
+    --preextract \
+    --device cuda \
+    --num_workers 16
+
 # From LibriSpeech
 python preprocess.py \
     --dataset librispeech \

@@ -1,6 +1,6 @@
 """
-preprocess.py — Data Preparation Scripts
-=========================================
+preprocess.py — Data Preparation Scripts  (Multi-GPU Edition)
+=============================================================
 Prepares paired (Mimi tokens, HuBERT features, prosody) from raw audio datasets.
 
 Supports:
@@ -13,14 +13,17 @@ Outputs:
   - data/val.jsonl
   - (optionally) pre-cached feature tensors in data/cache/
 
-Usage:
-  python preprocess.py \
+Multi-GPU Usage (4× RTX 4090, RunPod):
+  # Recommended — torchrun launches one process per GPU automatically
+  torchrun --nproc_per_node=4 preprocess.py \
       --dataset librispeech \
       --root /data/LibriSpeech/train-clean-100 \
       --out_dir data \
-      --split train \
-      --val_frac 0.01
+      --preextract \
+      --device cuda \
+      --num_workers 4
 
+  # Single-GPU / CPU (unchanged behaviour)
   python preprocess.py \
       --dataset generic \
       --root /data/my_audio \
@@ -30,15 +33,56 @@ Usage:
 import argparse
 import json
 import logging
-import os
-import random
 import math
+import os
+import queue
+import random
+import threading
 from pathlib import Path
 from typing import List, Tuple
 
 import yaml
 
 logger = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Distributed helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _dist_info() -> Tuple[int, int]:
+    """Return (local_rank, world_size).  Works with torchrun and plain python."""
+    rank  = int(os.environ.get("LOCAL_RANK", 0))
+    world = int(os.environ.get("WORLD_SIZE", 1))
+    return rank, world
+
+
+def _is_main() -> bool:
+    return _dist_info()[0] == 0
+
+
+def _init_dist():
+    """Initialise process group when launched with torchrun (WORLD_SIZE > 1)."""
+    rank, world = _dist_info()
+    if world > 1:
+        import torch.distributed as dist
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        return True
+    return False
+
+
+def _barrier():
+    """Synchronise all ranks (no-op in single-process mode)."""
+    _, world = _dist_info()
+    if world > 1:
+        import torch.distributed as dist
+        dist.barrier()
+
+
+def _shard_list(items: list, rank: int, world: int) -> list:
+    """Evenly divide `items` across `world` ranks; rank gets its slice."""
+    return items[rank::world]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -72,7 +116,7 @@ def discover_librispeech(root: str) -> List[Tuple[Path, str]]:
                 line = line.strip()
                 if not line:
                     continue
-                parts = line.split(" ", 1)
+                parts  = line.split(" ", 1)
                 utt_id = parts[0]
                 text   = parts[1] if len(parts) > 1 else ""
                 audio  = chapter_dir / f"{utt_id}.flac"
@@ -82,54 +126,85 @@ def discover_librispeech(root: str) -> List[Tuple[Path, str]]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Feature pre-extraction (optional, for faster training I/O)
+# Feature pre-extraction — multi-GPU sharded
 # ──────────────────────────────────────────────────────────────────────────────
 
 def preextract_features(
     audio_paths: List[Path],
     cfg: dict,
     cache_dir: Path,
-    device: str = "cpu",
+    device_str: str = "cuda",
     batch_size: int = 1,
     num_workers: int = 4,
 ):
     """
-    Pre-extract and cache Mimi tokens + HuBERT features for a list of files.
+    Pre-extract and cache Mimi tokens + HuBERT features.
 
-    GPU acceleration
-    ────────────────
-    - Mimi model and waveforms are moved to `device` (CUDA when available).
-    - HuBERT ONNX uses CUDAExecutionProvider when device="cuda".
-    - Audio loading + resampling runs in `num_workers` background threads so
-      the GPU is kept busy while the next batch of files is read from disk.
-    - torchaudio resampling is done on the GPU (inside MimiExtractor /
-      HuBERTExtractor) instead of on CPU.
+    Multi-GPU strategy
+    ──────────────────
+    When launched with ``torchrun --nproc_per_node=N``:
+      - Each rank handles a disjoint shard of the file list  (rank-i processes
+        files[i::N]).  No GPU-to-GPU communication is required; this is purely
+        embarrassingly-parallel.
+      - Each rank binds to its own CUDA device  (cuda:0 … cuda:3).
+      - Rank 0 prints progress and summary; other ranks log to per-rank files.
+      - A barrier at the end ensures all ranks finish before the main process
+        continues.
 
-    Cache logic
-    ───────────
-    A file is considered fully cached only when BOTH the Mimi and HuBERT
-    cache files exist and are non-empty.  A partial cache (one file missing)
-    means the previous run crashed mid-way — both files are re-extracted to
-    guarantee consistency.
+    4× RTX 4090 specifics
+    ─────────────────────
+    - Each 4090 has 24 GB VRAM — models + audio fit easily.
+    - ``num_workers`` I/O threads per rank keep each GPU saturated.
+    - ``pin_memory=True`` + ``non_blocking=True`` GPU transfers maximise PCIe
+      throughput (4090 uses PCIe 4.0 x16 on most RunPod nodes).
     """
     import hashlib
-    import queue
-    import threading
     import torch
     import torchaudio
-    from dataset import MimiExtractor, HuBERTExtractor
-    import numpy as np
+    from dataset import MimiExtractor, HuBERTExtractor  # project-local
+
+    rank, world = _dist_info()
+
+    # ── Per-rank device assignment ────────────────────────────────────────────
+    # Support explicit "cuda:N", bare "cuda" (auto-assign by rank), or "cpu".
+    if device_str == "cuda" or device_str == "cuda:0":
+        if torch.cuda.is_available():
+            device = f"cuda:{rank % torch.cuda.device_count()}"
+        else:
+            device = "cpu"
+    else:
+        device = device_str   # user supplied explicit "cuda:2", "cpu", etc.
 
     use_cuda = device.startswith("cuda") and torch.cuda.is_available()
     if use_cuda:
-        logger.info(f"[preextract] GPU mode — device={device}, io_workers={num_workers}")
-    else:
-        logger.info(f"[preextract] CPU mode — io_workers={num_workers}")
+        torch.cuda.set_device(device)
+
+    # ── Per-rank logging setup ────────────────────────────────────────────────
+    rank_logger = logging.getLogger(f"rank{rank}")
+    if not _is_main():
+        log_path = cache_dir.parent / "logs" / f"rank{rank}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(log_path)
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        rank_logger.addHandler(fh)
+        rank_logger.setLevel(logging.INFO)
+        rank_logger.propagate = False
+
+    rank_logger.info(
+        f"[rank {rank}/{world}] device={device}, "
+        f"total_files={len(audio_paths)}, io_workers={num_workers}"
+    )
+
+    # ── Shard the work ────────────────────────────────────────────────────────
+    my_files = _shard_list(audio_paths, rank, world)
+    rank_logger.info(f"[rank {rank}] shard size = {len(my_files)} files")
+
+    sr = cfg["data"]["sample_rate"]
 
     mimi_ext   = MimiExtractor(cfg["paths"]["mimi_model"], device)
-    # hubert_model must point to the ONNX file, e.g. ./model/hubert_streaming_fix_kv.onnx
-    hubert_ext = HuBERTExtractor(cfg["paths"]["hubert_model"], device, chunk_batch=1)
-    sr         = cfg["data"]["sample_rate"]
+    hubert_ext = HuBERTExtractor(
+        cfg["paths"]["hubert_model"], device, chunk_batch=1
+    )
 
     cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -137,46 +212,43 @@ def preextract_features(
         h = hashlib.md5(str(p).encode()).hexdigest()
         return cache_dir / f"{h}_{suffix}.pt"
 
-    # ── Filter out already-cached files up front ──────────────────────────────
+    # ── Filter cached files ───────────────────────────────────────────────────
     todo: List[Path] = []
     n_skipped = 0
-    for audio_path in audio_paths:
-        cp_mimi   = cache_path(audio_path, "mimi")
-        cp_hubert = cache_path(audio_path, "hubert")
-        if (cp_mimi.exists() and cp_hubert.exists()
-                and cp_mimi.stat().st_size > 0
-                and cp_hubert.stat().st_size > 0):
+    for ap in my_files:
+        cp_m = cache_path(ap, "mimi")
+        cp_h = cache_path(ap, "hubert")
+        fully_cached = (
+            cp_m.exists() and cp_h.exists()
+            and cp_m.stat().st_size > 0
+            and cp_h.stat().st_size > 0
+        )
+        if fully_cached:
             n_skipped += 1
         else:
-            # Remove any stale partial files so extraction is consistent
-            if cp_mimi.exists() or cp_hubert.exists():
-                logger.warning(
-                    f"Partial cache detected for {audio_path.name}; re-extracting."
+            if cp_m.exists() or cp_h.exists():
+                rank_logger.warning(
+                    f"Partial cache for {ap.name}; re-extracting."
                 )
-            cp_mimi.unlink(missing_ok=True)
-            cp_hubert.unlink(missing_ok=True)
-            todo.append(audio_path)
+            cp_m.unlink(missing_ok=True)
+            cp_h.unlink(missing_ok=True)
+            todo.append(ap)
 
-    n_total   = len(audio_paths)
-    n_todo    = len(todo)
-    logger.info(
-        f"[preextract] {n_skipped}/{n_total} already cached — "
-        f"extracting {n_todo} files."
+    rank_logger.info(
+        f"[rank {rank}] {n_skipped}/{len(my_files)} already cached — "
+        f"extracting {len(todo)} files"
     )
 
     if not todo:
-        logger.info("Pre-extraction complete: nothing to do.")
+        rank_logger.info(f"[rank {rank}] Nothing to extract.")
+        _barrier()
         return
 
-    # ── Parallel I/O: load audio in background threads ────────────────────────
-    # Queue size = 2 × num_workers keeps the GPU busy without excessive RAM use.
+    # ── Parallel I/O queue ────────────────────────────────────────────────────
     _SENTINEL = None
-    load_q: "queue.Queue[Tuple[Path, torch.Tensor] | None]" = queue.Queue(
-        maxsize=num_workers * 2
-    )
+    load_q: "queue.Queue" = queue.Queue(maxsize=num_workers * 2)
 
     def _load_worker(paths: List[Path]):
-        """Background thread: load + resample audio, push to queue."""
         for ap in paths:
             try:
                 wav, file_sr = torchaudio.load(str(ap))
@@ -184,24 +256,16 @@ def preextract_features(
                     wav = wav.mean(0, keepdim=True)
                 if file_sr != sr:
                     wav = torchaudio.functional.resample(wav, file_sr, sr)
-                # Pin memory for faster CPU→GPU transfer
                 if use_cuda:
                     wav = wav.pin_memory()
                 load_q.put((ap, wav))
             except Exception as e:
-                logger.warning(f"[preextract] Load failed {ap}: {e}")
-                load_q.put((ap, None))   # signal failure for this file
+                rank_logger.warning(f"Load failed {ap}: {e}")
+                load_q.put((ap, None))
         load_q.put(_SENTINEL)
 
-    # Split file list across workers
-    chunk_size  = max(1, math.ceil(n_todo / num_workers))
-    worker_chunks = [todo[i : i + chunk_size] for i in range(0, n_todo, chunk_size)]
-    completed_workers = [0]
-    lock = threading.Lock()
-    final_sentinel_count = [0]
-
-    def _worker_wrapper(paths):
-        _load_worker(paths)
+    chunk_size    = max(1, math.ceil(len(todo) / num_workers))
+    worker_chunks = [todo[i : i + chunk_size] for i in range(0, len(todo), chunk_size)]
 
     threads = []
     for chunk in worker_chunks:
@@ -209,63 +273,68 @@ def preextract_features(
         t.start()
         threads.append(t)
 
-    # ── Main loop: GPU extraction ─────────────────────────────────────────────
-    n_done   = 0
-    n_failed = 0
-    sentinels_seen = 0
+    # ── GPU extraction loop ───────────────────────────────────────────────────
+    import torch
+
+    n_done = n_failed = sentinels = 0
     n_workers = len(threads)
 
-    # Use tqdm if available for a progress bar
-    try:
-        from tqdm import tqdm
-        pbar = tqdm(total=n_todo, desc="Extracting", unit="file", dynamic_ncols=True)
-    except ImportError:
-        pbar = None
+    # tqdm only on rank-0 to avoid interleaved output
+    pbar = None
+    if _is_main():
+        try:
+            from tqdm import tqdm
+            pbar = tqdm(
+                total=len(todo) * world,   # approximate global total
+                desc=f"Extracting [{world} GPU(s)]",
+                unit="file",
+                dynamic_ncols=True,
+            )
+        except ImportError:
+            pass
 
-    while sentinels_seen < n_workers:
+    while sentinels < n_workers:
         item = load_q.get()
-
         if item is _SENTINEL:
-            sentinels_seen += 1
+            sentinels += 1
             continue
 
-        audio_path, wav = item
+        ap, wav = item
+        cp_m = cache_path(ap, "mimi")
+        cp_h = cache_path(ap, "hubert")
 
         if wav is None:
             n_failed += 1
-            if pbar:
-                pbar.update(1)
-            continue
+        else:
+            try:
+                if use_cuda:
+                    wav = wav.to(device, non_blocking=True)
 
-        cp_mimi   = cache_path(audio_path, "mimi")
-        cp_hubert = cache_path(audio_path, "hubert")
+                with torch.no_grad():
+                    tokens = mimi_ext.extract(wav, sr)   # (T_m, num_codebooks)
+                    hubert = hubert_ext.extract(wav, sr)  # (T_h, feat_dim)
 
-        try:
-            # Non-blocking GPU transfer when pinned memory is available
-            if use_cuda:
-                wav = wav.to(device, non_blocking=True)
+                torch.save(tokens, cp_m)
+                torch.save(hubert, cp_h)
+                n_done += 1
 
-            with torch.no_grad():
-                tokens = mimi_ext.extract(wav, sr)    # (T_m, num_codebooks)
-                hubert = hubert_ext.extract(wav, sr)  # (T_h, feat_dim)
-
-            torch.save(tokens, cp_mimi)
-            torch.save(hubert, cp_hubert)
-            n_done += 1
-
-        except Exception as e:
-            logger.warning(f"[preextract] Extraction failed {audio_path}: {e}")
-            n_failed += 1
-            cp_mimi.unlink(missing_ok=True)
-            cp_hubert.unlink(missing_ok=True)
+            except Exception as e:
+                rank_logger.warning(f"Extraction failed {ap}: {e}")
+                n_failed += 1
+                cp_m.unlink(missing_ok=True)
+                cp_h.unlink(missing_ok=True)
 
         if pbar:
-            pbar.update(1)
-            pbar.set_postfix(done=n_done, failed=n_failed, skipped=n_skipped)
+            pbar.update(world)  # each GPU processed one file simultaneously
+            pbar.set_postfix(
+                rank0_done=n_done,
+                rank0_fail=n_failed,
+                skipped=n_skipped,
+            )
         elif (n_done + n_failed) % 100 == 0:
-            logger.info(
-                f"  {n_done+n_failed}/{n_todo} — "
-                f"done={n_done} skipped={n_skipped} failed={n_failed}"
+            rank_logger.info(
+                f"[rank {rank}] {n_done+n_failed}/{len(todo)} — "
+                f"done={n_done} skip={n_skipped} fail={n_failed}"
             )
 
     if pbar:
@@ -274,10 +343,19 @@ def preextract_features(
     for t in threads:
         t.join()
 
-    logger.info(
-        f"Pre-extraction complete: {n_done} new, {n_skipped} cached, "
-        f"{n_failed} failed, {n_total} total"
+    rank_logger.info(
+        f"[rank {rank}] Done — new={n_done}, cached={n_skipped}, "
+        f"failed={n_failed}"
     )
+
+    # ── Wait for all ranks before returning ───────────────────────────────────
+    _barrier()
+
+    if _is_main():
+        logger.info(
+            f"Pre-extraction complete across {world} GPU(s). "
+            f"Rank-0: new={n_done}, skipped={n_skipped}, failed={n_failed}"
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -298,8 +376,12 @@ def build_manifests(
     val_frac: float = 0.01,
     seed: int = 42,
 ):
-    """Split into train/val manifests."""
-    rng = random.Random(seed)
+    """Split into train/val manifests.  Only rank-0 writes files."""
+    if not _is_main():
+        _barrier()          # non-main ranks wait for rank-0 to finish writing
+        return
+
+    rng   = random.Random(seed)
     pairs = list(audio_pairs)
     rng.shuffle(pairs)
 
@@ -314,62 +396,101 @@ def build_manifests(
     write_manifest([to_record(p, t) for p, t in val],   out_dir / "val.jsonl")
     logger.info(f"Train: {len(train)} | Val: {len(val)}")
 
+    _barrier()              # signal non-main ranks they can proceed
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Main CLI
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Preprocess audio data for bridge training")
-    parser.add_argument("--dataset",   choices=["librispeech", "voxceleb", "generic"],
-                        default="generic")
-    parser.add_argument("--root",      required=True, help="Root directory of audio")
-    parser.add_argument("--out_dir",   default="data", help="Output directory for manifests")
-    parser.add_argument("--config",    default="config.yaml")
-    parser.add_argument("--val_frac",  type=float, default=0.01)
-    parser.add_argument("--preextract", action="store_true",
-                        help="Pre-extract and cache Mimi + HuBERT features")
-    parser.add_argument("--device",    default="cpu")
-    parser.add_argument("--seed",      type=int, default=42)
-    parser.add_argument("--num_workers", type=int, default=4,
-                        help="Number of parallel I/O threads for audio loading (GPU mode)")
+    parser = argparse.ArgumentParser(
+        description="Preprocess audio data for bridge training (multi-GPU)"
+    )
+    parser.add_argument(
+        "--dataset", choices=["librispeech", "voxceleb", "generic"],
+        default="generic",
+    )
+    parser.add_argument("--root",     required=True, help="Root directory of audio")
+    parser.add_argument("--out_dir",  default="data", help="Output dir for manifests")
+    parser.add_argument("--config",   default="config.yaml")
+    parser.add_argument("--val_frac", type=float, default=0.01)
+    parser.add_argument(
+        "--preextract", action="store_true",
+        help="Pre-extract and cache Mimi + HuBERT features",
+    )
+    parser.add_argument(
+        "--device", default="cuda",
+        help=(
+            '"cuda"  → each rank auto-assigns cuda:rank  (recommended for RunPod)\n'
+            '"cuda:N" → pin all ranks to one GPU\n'
+            '"cpu"   → CPU-only mode'
+        ),
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--num_workers", type=int, default=4,
+        help="I/O threads per GPU rank for parallel audio loading",
+    )
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # ── Distributed init ──────────────────────────────────────────────────────
+    _init_dist()
+    rank, world = _dist_info()
+
+    log_level = logging.INFO if _is_main() else logging.WARNING
+    logging.basicConfig(
+        level=log_level,
+        format=f"[rank {rank}] %(asctime)s %(levelname)s %(message)s",
+    )
+
+    if _is_main():
+        logger.info(f"Running with {world} process(es) / GPU(s)")
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
     out_dir = Path(args.out_dir)
 
-    # ── Discover files ──────────────────────────────────────────────────────
-    logger.info(f"Discovering {args.dataset} audio under {args.root}")
+    # ── Discover files (all ranks do discovery; it's read-only + fast) ────────
+    if _is_main():
+        logger.info(f"Discovering {args.dataset} audio under {args.root}")
 
     if args.dataset == "librispeech":
         pairs = discover_librispeech(args.root)
-        logger.info(f"Found {len(pairs)} LibriSpeech utterances")
+        if _is_main():
+            logger.info(f"Found {len(pairs)} LibriSpeech utterances")
     else:
-        # generic / voxceleb: no transcripts available upfront
         audio_files = discover_audio(args.root)
         pairs = [(p, "") for p in audio_files]
-        logger.info(f"Found {len(pairs)} audio files")
+        if _is_main():
+            logger.info(f"Found {len(pairs)} audio files")
 
     if not pairs:
-        logger.error("No audio files found. Check --root path.")
+        if _is_main():
+            logger.error("No audio files found. Check --root path.")
         return
 
-    # ── Build manifests ─────────────────────────────────────────────────────
+    # ── Build manifests (rank-0 only, others wait at barrier) ─────────────────
     build_manifests(pairs, out_dir, val_frac=args.val_frac, seed=args.seed)
 
-    # ── Optional pre-extraction ─────────────────────────────────────────────
+    # ── Optional pre-extraction (all ranks participate) ───────────────────────
     if args.preextract:
-        logger.info("Pre-extracting features...")
-        cache_dir = Path(cfg["data"]["cache_dir"])
+        if _is_main():
+            logger.info(
+                f"Pre-extracting features across {world} GPU(s). "
+                f"Each GPU handles ~{len(pairs)//world} files."
+            )
+        cache_dir  = Path(cfg["data"]["cache_dir"])
         audio_only = [p for p, _ in pairs]
-        preextract_features(audio_only, cfg, cache_dir, device=args.device,
-                            num_workers=args.num_workers)
+        preextract_features(
+            audio_only, cfg, cache_dir,
+            device_str=args.device,
+            num_workers=args.num_workers,
+        )
 
-    logger.info("Preprocessing done.")
+    if _is_main():
+        logger.info("Preprocessing done.")
 
 
 if __name__ == "__main__":
