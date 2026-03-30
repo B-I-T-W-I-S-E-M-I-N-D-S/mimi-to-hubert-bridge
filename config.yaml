@@ -1,0 +1,89 @@
+# ============================================================
+# Mimi-to-HuBERT Bridge Module — Full Configuration
+# ============================================================
+
+model:
+  # --- Embedding ---
+  num_codebooks: 8
+  vocab_size: 2048
+  embed_dim: 256              # per-codebook embedding dim
+  embed_fusion: "sum"         # "sum" | "concat"
+  # if concat, d_model = embed_dim * num_codebooks = 2048 → projected down
+
+  # --- Temporal Upsampling ---
+  upsample_factor: 4
+  upsample_kernel: 4          # must equal stride for clean upsampling
+
+  # --- Transformer ---
+  d_model: 512                # hidden size inside transformer
+  nhead: 8
+  num_layers: 4
+  dim_feedforward: 2048
+  dropout: 0.1
+  causal: true                # causal masking for streaming
+  pos_encoding: "relative"    # "relative" | "sinusoidal"
+  max_seq_len: 2048
+
+  # --- Output ---
+  output_dim: 1024            # HuBERT-large feature dimensionality
+
+training:
+  batch_size: 16
+  num_epochs: 50
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  lr_scheduler: "cosine"      # "cosine" | "step" | "plateau"
+  warmup_steps: 1000
+  grad_clip: 1.0
+  mixed_precision: true
+  seed: 42
+
+  # --- Loss Weights ---
+  loss_weights:
+    recon:      1.0           # MSE vs HuBERT
+    ctc:        0.3           # ASR consistency
+    prosody:    0.2           # pitch + energy
+    adv:        0.1           # adversarial
+    stat:       0.1           # mean/var matching
+    smooth:     0.05          # temporal smoothness
+    alignment:  0.1           # phoneme alignment (optional)
+
+  # --- Discriminator ---
+  disc_lr: 2.0e-4
+  disc_start_step: 5000       # delay adversarial training
+  disc_hidden: 512
+  disc_layers: 4
+
+  # --- CTC / ASR head ---
+  ctc_vocab_size: 31          # e.g. English phonemes
+  freeze_ctc_head: true       # pretrained, frozen
+
+  # --- Prosody ---
+  f0_min: 50.0
+  f0_max: 600.0
+  hop_length: 160             # for pitch/energy extraction (at 16kHz → 10ms)
+
+data:
+  sample_rate: 16000
+  mimi_rate: 12.5             # Hz — Mimi output rate
+  hubert_rate: 50.0           # Hz — HuBERT output rate
+  max_audio_seconds: 20.0
+  train_manifest: "data/train.jsonl"
+  val_manifest: "data/val.jsonl"
+  num_workers: 4
+  cache_features: true
+  cache_dir: "data/cache"
+
+paths:
+  # HuBERT-large (1024-dim hidden states) — required for 1024-d targets
+  hubert_model: "facebook/hubert-large-ls960-ft"
+  # Mimi encoder via HuggingFace — no moshi git install needed
+  mimi_model: "kyutai/moshiko-pytorch-bf16"
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+  tensorboard: true
+
+inference:
+  chunk_size: 50              # timesteps (Mimi frames) per chunk for streaming
+  kv_cache: true
+  device: "cuda"
