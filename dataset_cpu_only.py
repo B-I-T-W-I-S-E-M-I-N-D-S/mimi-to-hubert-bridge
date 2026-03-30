@@ -309,134 +309,82 @@ class HuBERTExtractor:
     Produces (T, 1024) float32 features at 25 Hz (one frame per 40 ms),
     with each output frame being the mean of two 20 ms ONNX encoder frames.
 
-    GPU acceleration strategy
-    ─────────────────────────
-    1. ONNX runtime   — uses CUDAExecutionProvider when device="cuda",
-                        automatically falls back to CPU if CUDA EP is unavailable.
-    2. Resampling     — done on the GPU via torchaudio.functional.resample()
-                        instead of librosa (CPU-only).
-    3. Batched chunks — all overlapping chunks for one utterance are stacked
-                        into a single batched ONNX call, maximising GPU occupancy
-                        and avoiding per-chunk Python overhead.
-    4. Pinned memory  — numpy arrays passed to the ONNX CUDA EP are allocated
-                        as pinned (page-locked) memory so DMA transfers are async.
+    This replaces the transformers HubertModel backend which required a
+    PyTorch HuBERT checkpoint and a Wav2Vec2FeatureExtractor.
 
     Args:
-        model_name   : Path to the .onnx model file
-                       (e.g. "./model/hubert_streaming_fix_kv.onnx")
-        device       : "cuda" | "cuda:N" | "cpu"
-        chunk_batch  : How many chunks to run in one batched ONNX call.
-                       Larger = more GPU utilisation; reduce if OOM.
-                       Default 32 works well for a 16 GB GPU.
+        model_name : Path to the .onnx model file
+                     (e.g. "./model/hubert_streaming_fix_kv.onnx")
+        device     : Ignored — ONNX runtime always runs on CPU.
+                     Kept for API compatibility with MimiExtractor.
     """
 
     # ONNX streaming chunk config: (left_context, centre, right_context) in frames
-    _CHUNKSIZE  = (3, 5, 2)
-    _FEAT_DIM   = 1024   # HuBERT-large hidden size
-    _TARGET_SR  = 16000  # Model expects 16 kHz audio
+    _CHUNKSIZE = (3, 5, 2)
+    _FEAT_DIM  = 1024   # HuBERT-large hidden size
+    _TARGET_SR = 16000  # Model expects 16 kHz audio
 
     def __init__(
         self,
-        model_name:  str = "./model/hubert_streaming_fix_kv.onnx",
-        device:      str = "cpu",
-        chunk_batch: int = 32,
+        model_name: str = "./model/hubert_streaming_fix_kv.onnx",
+        device: str = "cpu",   # kept for API compatibility; ONNX runs on CPU
     ):
-        self.device      = device
-        self._ok         = False
-        self._feat_dim   = self._FEAT_DIM
-        self._chunk_batch = chunk_batch
-        self._use_cuda   = device.startswith("cuda")
+        self.device    = device
+        self._ok       = False
+        self._feat_dim = self._FEAT_DIM
 
         try:
-            import onnxruntime as ort
+            import onnxruntime
+            import librosa as _librosa  # noqa: F401 — verify availability
 
             logger.info(f"[HuBERTExtractor] Loading ONNX model from {model_name} …")
-            sess_opt = ort.SessionOptions()
+            sess_opt = onnxruntime.SessionOptions()
             sess_opt.intra_op_num_threads = 4
 
-            # ── Provider selection: prefer CUDA, fall back to CPU ─────────────
-            available = ort.get_available_providers()
-            if self._use_cuda and "CUDAExecutionProvider" in available:
-                # Extract device index from "cuda:N" (default 0)
-                dev_idx = 0
-                if ":" in device:
-                    dev_idx = int(device.split(":")[1])
-                providers = [
-                    ("CUDAExecutionProvider", {
-                        "device_id":               dev_idx,
-                        # Use CUDA streams for async host↔device transfers
-                        "arena_extend_strategy":   "kNextPowerOfTwo",
-                        "gpu_mem_limit":           4 * 1024 ** 3,   # 4 GB cap
-                        "cudnn_conv_algo_search":  "EXHAUSTIVE",
-                        "do_copy_in_default_stream": True,
-                    }),
-                    "CPUExecutionProvider",   # fallback
-                ]
-                logger.info(
-                    f"[HuBERTExtractor] Using CUDAExecutionProvider "
-                    f"(device_id={dev_idx}, chunk_batch={chunk_batch})."
-                )
-            else:
-                if self._use_cuda:
-                    logger.warning(
-                        "[HuBERTExtractor] CUDAExecutionProvider not available in this "
-                        "onnxruntime build — falling back to CPU. "
-                        "Install: pip install onnxruntime-gpu"
-                    )
-                    self._use_cuda = False
-                providers = ["CPUExecutionProvider"]
-                logger.info("[HuBERTExtractor] Using CPUExecutionProvider.")
-
-            self._ort_session = ort.InferenceSession(
+            self._ort_session = onnxruntime.InferenceSession(
                 model_name,
                 sess_options=sess_opt,
-                providers=providers,
+                providers=["CPUExecutionProvider"],
             )
             self._ok = True
             logger.info(
                 f"[HuBERTExtractor] ONNX HuBERT loaded successfully "
-                f"(feat_dim={self._feat_dim}, chunksize={self._CHUNKSIZE}, "
-                f"cuda={self._use_cuda})."
+                f"(feat_dim={self._feat_dim}, chunksize={self._CHUNKSIZE})."
             )
         except Exception as e:
             logger.warning(
                 f"[HuBERTExtractor] Could not load ONNX HuBERT from '{model_name}': {e}. "
                 "Using dummy extractor. "
-                "To fix: pip install onnxruntime-gpu librosa && check model path."
+                "To fix: pip install onnxruntime librosa && check model path."
             )
 
-    # ── Internal helpers ──────────────────────────────────────────────────────
+    # ── Internal ONNX inference ───────────────────────────────────────────────
 
-    def _resample_gpu(self, wav: torch.Tensor, orig_sr: int) -> torch.Tensor:
-        """
-        Resample wav (1, N) on GPU using torchaudio — much faster than librosa.
-        Returns (1, N') at _TARGET_SR, still on the same device as input.
-        """
-        if orig_sr == self._TARGET_SR:
-            return wav
-        if TORCHAUDIO_OK:
-            import torchaudio
-            return torchaudio.functional.resample(wav, orig_sr, self._TARGET_SR)
-        # librosa CPU fallback (should rarely hit this path)
-        import librosa
-        wav_np = wav.squeeze().cpu().numpy().astype(np.float32)
-        resampled = librosa.resample(wav_np, orig_sr=orig_sr, target_sr=self._TARGET_SR)
-        return torch.from_numpy(resampled).unsqueeze(0).to(wav.device)
+    def _forward_chunk(self, waveform_chunk: np.ndarray) -> np.ndarray:
+        """Run one chunk through the ONNX encoder. Returns (chunk_frames, 1024)."""
+        encoding = self._ort_session.run(
+            None,
+            {"input_values": waveform_chunk[None, :].astype(np.float32)},
+        )[0]   # (1, chunk_frames, 1024) or (chunk_frames, 1024)
+        if encoding.ndim == 3:
+            encoding = encoding[0]   # squeeze batch dim if present
+        return encoding              # (chunk_frames, 1024)
 
-    def _build_chunks(self, speech: np.ndarray) -> Tuple[np.ndarray, int]:
+    def _extract_from_numpy(self, speech: np.ndarray) -> np.ndarray:
         """
-        Slice and pad speech into overlapping input chunks.
+        Streaming chunk extraction matching hubert_streaming_onnx.py exactly.
 
-        Returns
-        -------
-        chunks   : (N_chunks, split_len) float32 array
-        num_f    : total number of expected output frames
+        speech   : 1-D float32 array at 16 kHz
+        Returns  : (T, 1024) float32 numpy array at 25 Hz
         """
-        chunksize = self._CHUNKSIZE
+        chunksize = self._CHUNKSIZE     # (3, 5, 2)
         sr        = self._TARGET_SR
 
-        num_f     = math.ceil(len(speech) / sr * 25)
+        num_f    = math.ceil(len(speech) / sr * 25)   # total output frames at 25 Hz
         split_len = int(sum(chunksize) * 0.04 * sr) + 80
+
+        # Pad signal: left pad = left_context + right_context samples, right pad = split_len
+        left_pad_frames = chunksize[0] + chunksize[2]   # = sum(chunksize) - centre = 5
         left_pad  = split_len - int(sum(chunksize[1:]) * 0.04 * sr)
         right_pad = split_len
 
@@ -446,65 +394,25 @@ class HuBERTExtractor:
             np.zeros(right_pad, dtype=speech.dtype),
         ])
 
-        chunks = []
+        # Indices into the ONNX output that are the "valid" centre frames
+        valid_feat_s = -sum(chunksize[1:]) * 2   # -(5+2)*2 = -14
+        valid_feat_e = -chunksize[2] * 2          # -2*2    = -4
+
+        res_lst = []
         i = 0
         while i < num_f:
             sss = int(i * 0.04 * sr)
-            chunks.append(speech_pad[sss : sss + split_len])
+            eee = sss + split_len
+            chunk_enc = self._forward_chunk(speech_pad[sss:eee])  # (20, 1024)
+
+            valid_enc  = chunk_enc[valid_feat_s:valid_feat_e]     # (10, 1024)
+            # Average pairs of 20 ms frames → 40 ms / 25 Hz output
+            valid_feat = valid_enc.reshape(chunksize[1], 2, self._FEAT_DIM).mean(1)  # (5, 1024)
+            res_lst.append(valid_feat)
             i += chunksize[1]
 
-        # Stack into a single array: (N_chunks, split_len)
-        return np.stack(chunks, axis=0).astype(np.float32), num_f
-
-    def _run_batched_onnx(self, chunks: np.ndarray) -> np.ndarray:
-        """
-        Run all chunks through the ONNX session in mini-batches of
-        self._chunk_batch.  Returns (N_chunks, frames_per_chunk, 1024).
-        Using pinned memory for CUDA EP accelerates host→device DMA.
-        """
-        N          = chunks.shape[0]
-        batch_sz   = self._chunk_batch
-        results    = []
-
-        for start in range(0, N, batch_sz):
-            batch = chunks[start : start + batch_sz]   # (B, split_len)
-
-            # Pinned memory for async DMA when using CUDA EP
-            if self._use_cuda:
-                pinned = np.empty_like(batch)
-                np.copyto(pinned, batch)
-                batch = pinned
-
-            enc = self._ort_session.run(
-                None, {"input_values": batch}
-            )[0]   # (B, frames_per_chunk, 1024) or (B*frames, 1024)
-
-            # Normalise to 3-D: (B, frames_per_chunk, 1024)
-            if enc.ndim == 2:
-                enc = enc.reshape(batch.shape[0], -1, self._FEAT_DIM)
-            results.append(enc)
-
-        return np.concatenate(results, axis=0)   # (N_chunks, frames_per_chunk, 1024)
-
-    def _postprocess(self, all_enc: np.ndarray, num_f: int) -> np.ndarray:
-        """
-        Slice valid centre frames and average 20 ms pairs → 25 Hz output.
-
-        all_enc : (N_chunks, frames_per_chunk, 1024)
-        Returns : (num_f, 1024) float32
-        """
-        chunksize    = self._CHUNKSIZE
-        valid_feat_s = -sum(chunksize[1:]) * 2   # -14
-        valid_feat_e = -chunksize[2] * 2          # -4
-
-        # Slice valid frames from each chunk: (N_chunks, 10, 1024)
-        valid = all_enc[:, valid_feat_s:valid_feat_e, :]
-
-        # Mean-pool pairs of 20 ms frames → 40 ms / 25 Hz: (N_chunks, 5, 1024)
-        valid = valid.reshape(all_enc.shape[0], chunksize[1], 2, self._FEAT_DIM).mean(axis=2)
-
-        # Flatten chunks: (N_chunks * 5, 1024) then trim
-        ret = valid.reshape(-1, self._FEAT_DIM)[:num_f]
+        ret = np.concatenate(res_lst, axis=0)  # (N*5, 1024)
+        ret = ret[:num_f]                       # trim to exact length
         return ret.astype(np.float32)
 
     # ── Public interface ──────────────────────────────────────────────────────
@@ -513,34 +421,27 @@ class HuBERTExtractor:
         """
         Extract HuBERT features from a waveform tensor.
 
-        wav : (1, samples) float32 torch.Tensor — any sample rate.
-              If device="cuda" the tensor may already be on GPU; resampling
-              is performed on whichever device the tensor lives on.
+        wav : (1, samples) float32 torch.Tensor — any sample rate
+              (resampled internally to 16 kHz before ONNX inference)
         sr  : sample rate of `wav`
 
-        Returns: (T, 1024) float32 torch.Tensor on CPU
+        Returns: (T, 1024) float32 torch.Tensor at 25 Hz
         """
         if not self._ok:
             T = max(1, wav.shape[-1] // 640)   # approx 25 Hz at 16 kHz
             return torch.randn(T, self._feat_dim)
 
-        # ── 1. GPU resampling (torchaudio) ────────────────────────────────────
+        import librosa
+
+        # Convert torch tensor → numpy mono float32
+        wav_np = wav.squeeze().numpy().astype(np.float32)
+
+        # Resample to 16 kHz if needed (librosa handles any source SR)
         if sr != self._TARGET_SR:
-            wav = self._resample_gpu(wav, sr)
+            wav_np = librosa.resample(wav_np, orig_sr=sr, target_sr=self._TARGET_SR)
 
-        # ── 2. To numpy for ONNX (CUDA EP handles host→device internally) ─────
-        wav_np = wav.squeeze().cpu().numpy().astype(np.float32)
-
-        # ── 3. Build overlapping chunks ───────────────────────────────────────
-        chunks, num_f = self._build_chunks(wav_np)   # (N_chunks, split_len)
-
-        # ── 4. Batched ONNX inference (GPU or CPU) ────────────────────────────
-        all_enc = self._run_batched_onnx(chunks)     # (N_chunks, 20, 1024)
-
-        # ── 5. Postprocess → 25 Hz output ────────────────────────────────────
-        feats = self._postprocess(all_enc, num_f)    # (T, 1024) numpy
-
-        return torch.from_numpy(feats)               # (T, 1024) float32 CPU tensor
+        feats = self._extract_from_numpy(wav_np)    # (T, 1024) numpy
+        return torch.from_numpy(feats)              # (T, 1024) float32 tensor
 
 
 def extract_f0_energy(
