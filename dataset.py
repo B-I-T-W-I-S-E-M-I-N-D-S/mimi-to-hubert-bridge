@@ -665,7 +665,7 @@ class MimiHuBERTDataset(Dataset):
     def _get_or_cache(self, audio_path: str, key: str, extractor_fn):
         cp = self._cache_path(audio_path, key)
         if self.cache_features and cp.exists():
-            return torch.load(cp, map_location="cpu")
+            return torch.load(cp, map_location="cpu", weights_only=True)
         result = extractor_fn()
         if self.cache_features:
             torch.save(result, cp)
