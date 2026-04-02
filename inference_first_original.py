@@ -4,23 +4,10 @@ inference.py — Streaming & Batch Inference
 Provides:
   - BridgeInference: batch mode
   - StreamingBridgeInference: causal chunk-by-chunk streaming
-  - CLI entry point  (including --compare mode)
+  - CLI entry point
 
 Both modes produce HuBERT-compatible features (50 Hz, output_dim-dim) from
 Mimi tokens. output_dim is read from config.yaml (default: 1024 for HuBERT-large).
-
---compare mode (shortcut to compare_inference.py)
--------------------------------------------------
-  python inference.py \\
-      --audio  path/to/audio.wav \\
-      --checkpoint checkpoints/best.pt \\
-      --config config.yaml \\
-      --compare
-
-This extracts:
-  1. Real HuBERT features via the ONNX model (ground-truth)
-  2. Bridge-model prediction via Mimi tokens
-Then prints MSE / MAE / RMSE / cosine-similarity / SNR error metrics.
 """
 
 import argparse
@@ -292,10 +279,7 @@ def benchmark_streaming(
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Mimi-to-HuBERT Bridge Inference",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+    parser = argparse.ArgumentParser(description="Mimi-to-HuBERT Bridge Inference")
     parser.add_argument("--checkpoint", required=True,
                         help="Path to .pt checkpoint")
     parser.add_argument("--config",     required=True,
@@ -314,51 +298,12 @@ def main():
                         help="Run latency benchmark instead of inference")
     parser.add_argument("--device",     default=None,
                         help="Force device (cuda / cpu)")
-    # ── Compare mode ──────────────────────────────────────────────────────────
-    parser.add_argument("--compare",    action="store_true",
-                        help="""
-                        Compare real HuBERT output (ONNX) vs bridge model prediction
-                        for the given --audio file. Prints MSE/MAE/RMSE/cosine/SNR.
-                        Requires --audio.
-                        """)
-    parser.add_argument("--hubert-model", default=None,
-                        help="(compare mode) Override path to HuBERT ONNX file")
-    parser.add_argument("--mimi-model",   default=None,
-                        help="(compare mode) Override Mimi HF repo or local path")
-    parser.add_argument("--save-gt",      default=None,
-                        help="(compare mode) Save ground-truth features to .pt")
-    parser.add_argument("--save-pred",    default=None,
-                        help="(compare mode) Save bridge prediction features to .pt")
-    parser.add_argument("--compare-at-25hz", action="store_true",
-                        help="(compare mode) Downsample bridge pred to 25 Hz "
-                             "instead of upsampling HuBERT GT to 50 Hz")
-    parser.add_argument("--plot",         action="store_true",
-                        help="(compare mode) Show matplotlib heatmap plots")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     if args.benchmark:
         benchmark_streaming(args.checkpoint, args.config, chunk_size=args.chunk_size)
-        return
-
-    # ── Compare mode: delegate to compare_inference.compare() ─────────────────
-    if args.compare:
-        if args.audio is None:
-            parser.error("--compare requires --audio")
-        from compare_inference import compare as run_compare
-        run_compare(
-            audio_path            = args.audio,
-            checkpoint_path       = args.checkpoint,
-            config_path           = args.config,
-            device                = args.device,
-            hubert_model_override = args.hubert_model,
-            mimi_model_override   = args.mimi_model,
-            save_gt               = args.save_gt,
-            save_pred             = args.save_pred,
-            plot                  = args.plot,
-            compare_at_25hz       = args.compare_at_25hz,
-        )
         return
 
     if args.audio is None and args.tokens is None:
