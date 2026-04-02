@@ -8,11 +8,6 @@ Pipeline
          └──► MimiExtractor             → mimi_tokens (T_m, 8)
                └──► BridgeInference     → bridge_pred (4*T_m, 1024) ← model prediction
 
-Outputs (always saved automatically when called via --compare)
---------------------------------------------------------------
-  • bridge_pred_features.npy   — Bridge model output  (numpy float32)
-  • hubert_gt_features.npy     — HuBERT ONNX output   (numpy float32)
-
 Error Metrics (after aligning lengths)
 ---------------------------------------
   • MSE  (mean squared error)
@@ -31,15 +26,12 @@ Usage
 
 Optional flags
 --------------
-  --hubert-model        path to .onnx (overrides config paths.hubert_model)
-  --mimi-model          HF repo or local path for Mimi (overrides config paths.mimi_model)
-  --device              cuda | cpu  (default: auto)
-  --save-gt             path.pt     save ground-truth HuBERT features as .pt
-  --save-pred           path.pt     save bridge prediction features as .pt
-  --save-gt-npy         path.npy    save ground-truth HuBERT features as .npy (default: hubert_gt_features.npy)
-  --save-pred-npy       path.npy    save bridge prediction features as .npy (default: bridge_pred_features.npy)
-  --no-auto-save-npy    disable automatic .npy saving
-  --plot                show matplotlib comparison plots (requires matplotlib)
+  --hubert-model   path to .onnx (overrides config paths.hubert_model)
+  --mimi-model     HF repo or local path for Mimi (overrides config paths.mimi_model)
+  --device         cuda | cpu  (default: auto)
+  --save-gt        path.pt     save ground-truth HuBERT features
+  --save-pred      path.pt     save bridge prediction features
+  --plot           show matplotlib comparison plots (requires matplotlib)
 """
 
 import argparse
@@ -103,56 +95,28 @@ def compute_metrics(gt: torch.Tensor, pred: torch.Tensor) -> dict:
     }
 
 
-def _quality_label(cos: float, snr: float) -> str:
-    """Return a human-readable quality verdict based on cosine sim and SNR."""
-    if cos >= 0.95 and snr >= 20:
-        return "🟢  EXCELLENT"
-    elif cos >= 0.85 and snr >= 10:
-        return "🟡  GOOD"
-    elif cos >= 0.70 and snr >= 5:
-        return "🟠  FAIR"
-    else:
-        return "🔴  POOR"
-
-
-def print_metrics(metrics: dict, gt_shape: tuple, pred_shape: tuple,
-                  saved_files: Optional[list] = None):
-    """Pretty-print the comparison metrics with quality verdict."""
-    bar  = "═" * 66
-    thin = "─" * 66
-
+def print_metrics(metrics: dict, gt_shape: tuple, pred_shape: tuple):
+    """Pretty-print the comparison metrics."""
+    bar = "═" * 62
     print(f"\n{bar}")
-    print("   HuBERT Ground-Truth  ◄vs►  Bridge Model Prediction")
+    print("  HuBERT Ground-Truth  vs  Bridge Model Prediction")
     print(bar)
     print(f"  Ground-truth shape  : {gt_shape}")
     print(f"  Prediction shape    : {pred_shape}")
-    print(thin)
+    print()
     print(f"  MSE             : {metrics['mse']:.6f}")
     print(f"  MAE             : {metrics['mae']:.6f}")
     print(f"  RMSE            : {metrics['rmse']:.6f}")
     print(f"  Mean cos-sim    : {metrics['mean_cosine']:.6f}  (1.0 = perfect)")
     print(f"  SNR             : {metrics['snr_db']:.2f} dB   (higher = better)")
-    print(thin)
-
-    verdict = _quality_label(metrics["mean_cosine"], metrics["snr_db"])
-    print(f"  Overall quality : {verdict}")
-    print(thin)
 
     # Top-5 worst dimensions
     per_dim = metrics["per_dim_rmse"]
     top5_vals, top5_idx = torch.topk(per_dim, min(5, len(per_dim)))
+    print()
     print("  Top-5 worst dimensions (by per-dim RMSE):")
     for rank, (idx, val) in enumerate(zip(top5_idx.tolist(), top5_vals.tolist()), 1):
-        bar_len = int(val / (top5_vals[0].item() + 1e-9) * 20)
-        bar_str = "█" * bar_len
-        print(f"    #{rank}  dim={idx:4d}   RMSE={val:.6f}  {bar_str}")
-
-    if saved_files:
-        print(thin)
-        print("  Saved outputs:")
-        for label, fpath in saved_files:
-            print(f"    {label:<28s} → {fpath}")
-
+        print(f"    #{rank}  dim={idx:4d}   RMSE={val:.6f}")
     print(bar)
 
 
@@ -181,26 +145,19 @@ def align_frames(gt: torch.Tensor, pred: torch.Tensor) -> tuple[torch.Tensor, to
 # ──────────────────────────────────────────────────────────────────────────────
 
 def compare(
-    audio_path:            str,
-    checkpoint_path:       str,
-    config_path:           str,
-    device:                Optional[str] = None,
+    audio_path:       str,
+    checkpoint_path:  str,
+    config_path:      str,
+    device:           Optional[str] = None,
     hubert_model_override: Optional[str] = None,
     mimi_model_override:   Optional[str] = None,
-    save_gt:               Optional[str] = None,
-    save_pred:             Optional[str] = None,
-    save_gt_npy:           Optional[str] = "hubert_gt_features.npy",
-    save_pred_npy:         Optional[str] = "bridge_pred_features.npy",
-    auto_save_npy:         bool = True,
-    plot:                  bool = False,
-    compare_at_25hz:       bool = False,
+    save_gt:          Optional[str] = None,
+    save_pred:        Optional[str] = None,
+    plot:             bool = False,
+    compare_at_25hz:  bool = False,
 ):
     """
     Full pipeline: WAV → HuBERT_gt + Bridge_pred → error metrics.
-
-    By default (auto_save_npy=True), both outputs are always saved as .npy files:
-      • bridge_pred_features.npy
-      • hubert_gt_features.npy
     """
     # ── Load config ───────────────────────────────────────────────────────────
     with open(config_path) as f:
@@ -277,47 +234,25 @@ def compare(
           f"pred={tuple(pred_aligned.shape)}")
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Compute metrics
+    # Compute & display metrics
     # ─────────────────────────────────────────────────────────────────────────
     print("\n[3/3] Computing error metrics…")
     metrics = compute_metrics(
         gt_aligned.float(),
         pred_aligned.float(),
     )
+    print_metrics(metrics, gt_shape=tuple(gt_aligned.shape),
+                  pred_shape=tuple(pred_aligned.shape))
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Save outputs — .npy (automatic) and .pt (optional)
+    # Optional: save tensors
     # ─────────────────────────────────────────────────────────────────────────
-    saved_files = []
-
-    # Always save .npy unless explicitly disabled
-    if auto_save_npy:
-        _pred_npy = save_pred_npy or "bridge_pred_features.npy"
-        _gt_npy   = save_gt_npy   or "hubert_gt_features.npy"
-
-        np.save(_pred_npy, pred_aligned.float().numpy())
-        saved_files.append(("Bridge pred (npy)", _pred_npy))
-
-        np.save(_gt_npy, gt_aligned.float().numpy())
-        saved_files.append(("HuBERT GT   (npy)", _gt_npy))
-
-    # Optional .pt saves (legacy / interop)
     if save_gt:
         torch.save(gt_aligned, save_gt)
-        saved_files.append(("HuBERT GT   (pt) ", save_gt))
+        print(f"\n  Saved GT features   → {save_gt}")
     if save_pred:
         torch.save(pred_aligned, save_pred)
-        saved_files.append(("Bridge pred (pt) ", save_pred))
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Display metrics
-    # ─────────────────────────────────────────────────────────────────────────
-    print_metrics(
-        metrics,
-        gt_shape=tuple(gt_aligned.shape),
-        pred_shape=tuple(pred_aligned.shape),
-        saved_files=saved_files if saved_files else None,
-    )
+        print(f"  Saved Pred features → {save_pred}")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Optional: matplotlib visualisation
@@ -415,20 +350,10 @@ def main():
     parser.add_argument("--mimi-model",  default=None,
                         help="Override Mimi HF repo or local path "
                              "(default: paths.mimi_model from config.yaml)")
-    # .pt saves (optional, legacy)
     parser.add_argument("--save-gt",     default=None,
                         help="Save ground-truth HuBERT features to this .pt file")
     parser.add_argument("--save-pred",   default=None,
                         help="Save bridge prediction features to this .pt file")
-    # .npy saves (automatic by default)
-    parser.add_argument("--save-gt-npy",   default="hubert_gt_features.npy",
-                        help="Path for ground-truth .npy output "
-                             "(default: hubert_gt_features.npy)")
-    parser.add_argument("--save-pred-npy", default="bridge_pred_features.npy",
-                        help="Path for bridge prediction .npy output "
-                             "(default: bridge_pred_features.npy)")
-    parser.add_argument("--no-auto-save-npy", action="store_true",
-                        help="Disable automatic .npy saving")
     parser.add_argument("--compare-at-25hz", action="store_true",
                         help="Compare at 25 Hz (downsample bridge pred) "
                              "instead of 50 Hz (upsample HuBERT GT)")
@@ -442,19 +367,16 @@ def main():
     )
 
     compare(
-        audio_path            = args.audio,
-        checkpoint_path       = args.checkpoint,
-        config_path           = args.config,
-        device                = args.device,
+        audio_path       = args.audio,
+        checkpoint_path  = args.checkpoint,
+        config_path      = args.config,
+        device           = args.device,
         hubert_model_override = args.hubert_model,
         mimi_model_override   = args.mimi_model,
-        save_gt               = args.save_gt,
-        save_pred             = args.save_pred,
-        save_gt_npy           = args.save_gt_npy,
-        save_pred_npy         = args.save_pred_npy,
-        auto_save_npy         = not args.no_auto_save_npy,
-        plot                  = args.plot,
-        compare_at_25hz       = args.compare_at_25hz,
+        save_gt          = args.save_gt,
+        save_pred        = args.save_pred,
+        plot             = args.plot,
+        compare_at_25hz  = args.compare_at_25hz,
     )
 
 

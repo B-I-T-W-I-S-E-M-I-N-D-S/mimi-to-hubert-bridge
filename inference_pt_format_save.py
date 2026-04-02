@@ -18,16 +18,9 @@ Mimi tokens. output_dim is read from config.yaml (default: 1024 for HuBERT-large
       --compare
 
 This extracts:
-  1. Real HuBERT features via the ONNX model (ground-truth)  → hubert_gt_features.npy
-  2. Bridge-model prediction via Mimi tokens                 → bridge_pred_features.npy
+  1. Real HuBERT features via the ONNX model (ground-truth)
+  2. Bridge-model prediction via Mimi tokens
 Then prints MSE / MAE / RMSE / cosine-similarity / SNR error metrics.
-
-Override default .npy output paths with:
-  --save-gt-npy   my_hubert.npy
-  --save-pred-npy my_bridge.npy
-
-Disable auto .npy saving:
-  --no-auto-save-npy
 """
 
 import argparse
@@ -213,6 +206,7 @@ class StreamingBridgeInference:
         )
         self._past_kvs = present_kvs
 
+        # ── KV-cache trimming (prevent OOM on very long streams) ──────────────
         # The KV sequence length is in the upsampled (×4) space already.
         max_kv_len = self.cfg["model"].get("max_seq_len", 2048) * 4
         if self._past_kvs is not None:
@@ -311,7 +305,7 @@ def main():
     parser.add_argument("--tokens",     default=None,
                         help="Pre-extracted .pt token file (T, num_codebooks)")
     parser.add_argument("--output",     default="features.pt",
-                        help="Output .pt file path (non-compare mode)")
+                        help="Output .pt file path")
     parser.add_argument("--streaming",  action="store_true",
                         help="Use causal streaming mode (KV-cache)")
     parser.add_argument("--chunk-size", type=int, default=50,
@@ -320,32 +314,21 @@ def main():
                         help="Run latency benchmark instead of inference")
     parser.add_argument("--device",     default=None,
                         help="Force device (cuda / cpu)")
-
     # ── Compare mode ──────────────────────────────────────────────────────────
     parser.add_argument("--compare",    action="store_true",
-                        help=(
-                            "Compare real HuBERT output (ONNX) vs bridge model prediction "
-                            "for the given --audio file. Prints MSE/MAE/RMSE/cosine/SNR. "
-                            "Automatically saves bridge_pred_features.npy and "
-                            "hubert_gt_features.npy. Requires --audio."
-                        ))
+                        help="""
+                        Compare real HuBERT output (ONNX) vs bridge model prediction
+                        for the given --audio file. Prints MSE/MAE/RMSE/cosine/SNR.
+                        Requires --audio.
+                        """)
     parser.add_argument("--hubert-model", default=None,
                         help="(compare mode) Override path to HuBERT ONNX file")
     parser.add_argument("--mimi-model",   default=None,
                         help="(compare mode) Override Mimi HF repo or local path")
     parser.add_argument("--save-gt",      default=None,
-                        help="(compare mode) Also save ground-truth features as .pt")
+                        help="(compare mode) Save ground-truth features to .pt")
     parser.add_argument("--save-pred",    default=None,
-                        help="(compare mode) Also save bridge prediction features as .pt")
-    # ── .npy output paths (compare mode) ─────────────────────────────────────
-    parser.add_argument("--save-gt-npy",   default="hubert_gt_features.npy",
-                        help="(compare mode) Path for HuBERT GT .npy output "
-                             "[default: hubert_gt_features.npy]")
-    parser.add_argument("--save-pred-npy", default="bridge_pred_features.npy",
-                        help="(compare mode) Path for Bridge pred .npy output "
-                             "[default: bridge_pred_features.npy]")
-    parser.add_argument("--no-auto-save-npy", action="store_true",
-                        help="(compare mode) Disable automatic .npy saving")
+                        help="(compare mode) Save bridge prediction features to .pt")
     parser.add_argument("--compare-at-25hz", action="store_true",
                         help="(compare mode) Downsample bridge pred to 25 Hz "
                              "instead of upsampling HuBERT GT to 50 Hz")
@@ -373,9 +356,6 @@ def main():
             mimi_model_override   = args.mimi_model,
             save_gt               = args.save_gt,
             save_pred             = args.save_pred,
-            save_gt_npy           = args.save_gt_npy,
-            save_pred_npy         = args.save_pred_npy,
-            auto_save_npy         = not args.no_auto_save_npy,
             plot                  = args.plot,
             compare_at_25hz       = args.compare_at_25hz,
         )
@@ -431,3 +411,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
