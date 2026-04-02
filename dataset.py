@@ -340,6 +340,7 @@ class HuBERTExtractor:
         model_name:  str = "./model/hubert_streaming_fix_kv.onnx",
         device:      str = "cpu",
         chunk_batch: int = 32,
+        # chunk_batch: int = 1,     #inference time use batch size of 1 to reduce latency;
     ):
         self.device      = device
         self._ok         = False

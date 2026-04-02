@@ -171,6 +171,15 @@ python inference.py \
     --benchmark
 ```
 
+**Compare Loss:**
+```bash
+!python inference.py \
+  --checkpoint checkpoints/bridge_best.pt \
+  --config config.yaml \
+  --audio /content/audio.wav \
+  --compare
+```
+
 **Python API:**
 ```python
 from inference import BridgeInference, StreamingBridgeInference
